@@ -1,0 +1,204 @@
+---
+title: "MovieLens Rating Prediction"
+author: "Zainab Lunje"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", out.width = "85%")
+
+# Run the project script: it builds edx / final_holdout_test, trains every model
+# and leaves the results in memory (edx, rmse_results, best_lambda, best_params,
+# final_rmse), so the numbers in this report always match the script.
+# Warning: this step is slow (matrix factorization).
+source("movielens.R", echo = FALSE)
+```
+
+# Introduction
+
+Recommendation systems suggest items to users by predicting how they would rate them. Streaming services and online shops use them to decide what to show each person. This project builds a movie recommendation system on the **MovieLens 10M** dataset, collected by the GroupLens research lab.
+
+The data holds about 10 million ratings. The `edx` set used for development has `r format(nrow(edx), big.mark = ",")` ratings from `r format(n_distinct(edx$userId), big.mark = ",")` users on `r format(n_distinct(edx$movieId), big.mark = ",")` movies. Each row has a user id, a movie id, a rating from 0.5 to 5 stars in half-star steps, a timestamp, the movie title (with release year) and its genres. A separate `final_holdout_test` set with 10% of the data is kept aside and used only once, at the end, to measure the final model.
+
+**Goal:** predict the rating a user gives a movie as accurately as possible. Accuracy is measured with the root mean squared error (RMSE):
+
+$$RMSE = \sqrt{\frac{1}{N}\sum_{u,i}\left(\hat{y}_{u,i} - y_{u,i}\right)^2}$$
+
+where $y_{u,i}$ is the real rating of movie $i$ by user $u$ and $\hat{y}_{u,i}$ is the prediction. The RMSE is the typical prediction error in stars, so lower is better.
+
+**Key steps:** (1) prepare the data and split `edx` into a training and a validation set, (2) explore the data, (3) build models of increasing complexity (overall mean, movie and user effects, regularized effects, matrix factorization), compare them on the validation set, and (4) train the best model on all of `edx` and report its RMSE once on `final_holdout_test`.
+
+# Methods
+
+## Data preparation
+
+The data creation code provided by the course downloads the files, joins ratings with movie information and splits off 10% as `final_holdout_test`. Users and movies in `final_holdout_test` are guaranteed to also appear in `edx`, and any rows removed by that check are returned to `edx`. No further cleaning is needed: `edx` has `r sum(is.na(edx$rating))` missing ratings.
+
+To develop models without touching `final_holdout_test`, `edx` is split again into a **training set** (90%) and a **validation set** (10%) using the same rule: every user and movie in the validation set also appears in the training set. All tuning decisions are made on this validation set.
+
+## Data exploration
+
+### Ratings
+
+```{r rating-dist, fig.height=3.5}
+edx %>%
+  count(rating) %>%
+  ggplot(aes(factor(rating), n)) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "Rating", y = "Number of ratings", title = "Distribution of ratings")
+```
+
+Ratings are skewed toward the high end: the most common values are 4, 3 and 5. Whole-star ratings (`r format(sum(edx$rating %% 1 == 0), big.mark = ",")` of them) are much more common than half-star ratings (`r format(sum(edx$rating %% 1 != 0), big.mark = ",")`). The average rating is `r round(mean(edx$rating), 3)`.
+
+### Movie effect
+
+```{r movie-effect, fig.height=3.5}
+movie_stats <- edx %>%
+  group_by(movieId) %>%
+  summarize(n = n(), avg = mean(rating))
+
+p1 <- ggplot(movie_stats, aes(n)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  scale_x_log10() +
+  labs(x = "Ratings per movie (log scale)", y = "Movies",
+       title = "Ratings per movie")
+p2 <- ggplot(movie_stats, aes(avg)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  labs(x = "Average rating", y = "Movies", title = "Average rating per movie")
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+Some movies are rated tens of thousands of times and others only a handful of times. Average ratings also differ widely between movies, so some movies are simply rated better than others. This motivates a **movie effect**. Averages of movies with very few ratings are unreliable, which motivates regularization.
+
+### User effect
+
+```{r user-effect, fig.height=3.5}
+user_stats <- edx %>%
+  group_by(userId) %>%
+  summarize(n = n(), avg = mean(rating))
+
+p1 <- ggplot(user_stats, aes(n)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  scale_x_log10(breaks = c(10, 100, 1000)) +
+  labs(x = "Ratings per user (log scale)", y = "Users",
+       title = "Ratings per user")
+p2 <- ggplot(user_stats, aes(avg)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  labs(x = "Average rating", y = "Users", title = "Average rating per user")
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+Users also differ a lot: the number of ratings per user ranges from `r format(min(user_stats$n), big.mark = ",")` to `r format(max(user_stats$n), big.mark = ",")`, and some users are generous while others are strict. This motivates a **user effect**.
+
+### Genres
+
+```{r genre-effect, fig.height=7}
+edx %>%
+  group_by(genres) %>%
+  summarize(n = n(), avg = mean(rating), se = sd(rating) / sqrt(n)) %>%
+  filter(n >= 50000) %>%
+  mutate(genres = reorder(genres, avg)) %>%
+  ggplot(aes(genres, avg, ymin = avg - 2 * se, ymax = avg + 2 * se)) +
+  geom_point() +
+  geom_errorbar() +
+  coord_flip() +
+  labs(x = NULL, y = "Average rating",
+       title = "Average rating by genre combination",
+       subtitle = "Combinations with at least 50,000 ratings") +
+  theme(plot.title.position = "plot")
+```
+
+Average ratings differ between genre combinations. These differences cover a narrower range than the averages of individual movies and users shown above, although large genre groups naturally smooth out much of the variation. The matrix factorization model can learn such taste patterns directly from the ratings, without genre being fed in by hand.
+
+## Modeling approach
+
+All models are fitted on the training set and compared by RMSE on the validation set.
+
+1. **Overall mean.** Predict the average rating $\mu$ for every user and movie. This is the baseline.
+2. **Movie effect.** $\hat{y}_{u,i} = \mu + b_i$, where $b_i$ is the average amount by which movie $i$ differs from $\mu$.
+3. **Movie + user effects.** $\hat{y}_{u,i} = \mu + b_i + b_u$, adding how much user $u$ typically rates above or below average.
+4. **Regularized effects.** Effects estimated from few ratings are noisy, so they are shrunk toward zero:
+
+   $$b_i = \frac{\sum_{u} (y_{u,i} - \mu)}{n_i + \lambda}$$
+
+   where $n_i$ is the number of ratings of movie $i$ (and similarly for $b_u$). The penalty $\lambda$ is tuned on the validation set.
+5. **Matrix factorization.** The ratings form a huge user-by-movie matrix with most cells empty. Matrix factorization approximates it as the product of two smaller matrices, giving each user and each movie a short vector of latent factors. The predicted rating is the dot product of the user's and movie's vectors, so it captures user-movie interactions (for example, a user who likes a certain kind of movie) that additive effects cannot. It is fitted with the `recosystem` package, which is designed for large sparse data. Its parameters (number of factors and the two regularization penalties) are tuned with cross-validation on the training set. Predictions are clipped to the valid range of 0.5 to 5.
+
+The best model is then retrained on **all of `edx`** with the tuned parameters and evaluated once on `final_holdout_test`.
+
+# Results
+
+```{r results-table}
+rmse_results %>%
+  mutate(RMSE = round(RMSE, 5)) %>%
+  knitr::kable(col.names = c("Method", "Validation RMSE"),
+               caption = "RMSE of each model on the validation set (cut from edx)")
+```
+
+```{r model-comparison, fig.height=3}
+rmse_results %>%
+  mutate(method = factor(method, levels = rev(method))) %>%
+  ggplot(aes(RMSE, method)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = sprintf("%.4f", RMSE)), hjust = -0.1, size = 3.2) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Validation RMSE (lower is better)", y = NULL,
+       title = "Comparison of the five models")
+```
+
+```{r gains}
+v <- rmse_results$RMSE
+```
+
+## What each step contributed
+
+The **overall mean** gives an RMSE of `r round(v[1], 4)`, a typical error of slightly more than one star. It ignores who is rating and what is being rated.
+
+Adding the **movie effect** lowers the RMSE by `r round(v[1] - v[2], 4)`, and adding the **user effect** lowers it by a further `r round(v[2] - v[3], 4)`. Most of what the simple models can explain therefore comes from two facts seen in the exploration: some movies are better liked than others, and some users rate more generously than others.
+
+## Choosing the regularization penalty
+
+```{r lambda-plot, fig.height=3}
+tibble(lambda = lambdas, RMSE = lambda_rmses) %>%
+  ggplot(aes(lambda, RMSE)) +
+  geom_line(color = "steelblue") +
+  geom_point(color = "steelblue") +
+  geom_vline(xintercept = best_lambda, linetype = "dashed") +
+  labs(x = expression(lambda), y = "Validation RMSE",
+       title = "Validation RMSE for each penalty value")
+```
+
+The lowest validation RMSE is at $\lambda$ = `r best_lambda`, inside the tested range of `r min(lambdas)` to `r max(lambdas)`. The curve is flat: the best and worst tested values differ by only `r sprintf("%.5f", diff(range(lambda_rmses)))`. Compared with the unregularized model, regularization improves the RMSE by `r sprintf("%.4f", v[3] - v[4])`. The gain is small because shrinkage mainly changes the estimates for movies and users with few ratings, and those account for a small share of all ratings.
+
+## Matrix factorization
+
+Matrix factorization performs best by a clear margin, with a validation RMSE of `r round(v[5], 4)`. This is `r round(v[4] - v[5], 4)` lower than the regularized effects model, a relative improvement of `r round(100 * (v[4] - v[5]) / v[4], 1)`%. The additive models assume that a movie's appeal shifts every user's rating by the same amount. Latent factors drop that assumption, so two users with the same average rating can receive different predictions for the same movie, based on the pattern of what each has rated before. The size of the gain suggests that such individual taste is an important part of rating behavior.
+
+## Final evaluation
+
+The matrix factorization model chosen on the validation set was retrained on all of `edx` with these tuned parameters: `r paste(names(best_params)[1:6], unlist(best_params)[1:6], sep = " = ", collapse = ", ")`.
+
+**Final RMSE on `final_holdout_test`: `r round(final_rmse, 5)`**
+
+This is the first and only time `final_holdout_test` was used. The final RMSE differs from the validation RMSE of the same method by `r round(abs(v[5] - final_rmse), 4)` and is `r ifelse(final_rmse < v[5], "lower", "higher")`. The two results are close, which indicates that the model generalizes to unseen ratings. A lower final error is plausible because the final model learns from all of `edx`, including the ratings previously held out for validation.
+
+# Conclusion
+
+This project built a movie rating prediction system on MovieLens 10M. Starting from the overall mean, each step reduced the RMSE on the validation set: movie effects, user effects, regularization, and finally matrix factorization. The final model, matrix factorization trained on all of `edx`, reaches an RMSE of **`r round(final_rmse, 5)`** on `final_holdout_test`.
+
+**Limitations.** The model uses only user ids, movie ids and the ratings. It ignores genres, release year and timestamps. It also cannot rate a new user or movie it has never seen (the cold-start problem), and training is slow compared with the simple effect models. The tuning grid was kept small so that the script runs in a reasonable time, so a larger search might improve the result slightly. The latent factors are also hard to interpret, and because training runs on several processor threads, the last decimals of the matrix factorization results can differ slightly between runs.
+
+**Future work.** Possible improvements are to add genre, release year and rating-time effects, to try a wider parameter search or other factorization settings, to combine models in an ensemble, and to handle new users and movies with content-based information.
+
+# References {-}
+
+- Chin, W.-S., Yuan, B.-W., Yang, M.-Y., Zhuang, Y., Juan, Y.-C. and Lin, C.-J. (2016). LIBMF: A library for parallel matrix factorization in shared-memory systems. *Journal of Machine Learning Research*, 17(86), 1-5.
+- Harper, F. M. and Konstan, J. A. (2015). The MovieLens datasets: History and context. *ACM Transactions on Interactive Intelligent Systems*, 5(4), Article 19.
+- Irizarry, R. A. (2019). *Introduction to Data Science: Data Analysis and Prediction Algorithms with R*. CRC Press.
+- Koren, Y., Bell, R. and Volinsky, C. (2009). Matrix factorization techniques for recommender systems. *Computer*, 42(8), 30-37.
+- Qiu, Y. et al. `recosystem`: Recommender system using matrix factorization. R package version `r as.character(packageVersion("recosystem"))`. <https://CRAN.R-project.org/package=recosystem>
